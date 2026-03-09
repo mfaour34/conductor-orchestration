@@ -1,0 +1,295 @@
+#!/bin/bash
+# pr-poller — Standalone GitHub PR/CI poller for all agent-deck sessions
+# Runs every 120s via launchd (com.braizio.pr-poller)
+# Writes PR cache files that statusline.sh reads for rendering.
+
+set -euo pipefail
+
+# Source environment for PATH, gh auth, etc.
+# shellcheck source=/dev/null
+[ -f "$HOME/.zshenv" ] && source "$HOME/.zshenv"
+
+# Bail if dependencies are missing
+for cmd in gh jq git tmux agent-deck; do
+    command -v "$cmd" >/dev/null 2>&1 || exit 0
+done
+
+# ─── GraphQL query ────────────────────────────────────────────────────────────
+PR_GRAPHQL_QUERY='query($owner: String!, $repo: String!, $branch: String!) { repository(owner: $owner, name: $repo) { pullRequests(headRefName: $branch, first: 1, states: [OPEN, MERGED, CLOSED]) { nodes { number state isDraft reviewDecision mergeable reviewThreads(first: 100) { nodes { isResolved } } commits(last: 1) { nodes { commit { oid statusCheckRollup { state } } } } } } } }'
+
+# ─── PR status → emoji ───────────────────────────────────────────────────────
+pr_status_emoji() {
+    case "$1" in
+        Draft)         echo "📝" ;;
+        "PR Open")     echo "🆕" ;;
+        "In Review")   echo "🔍" ;;
+        "Changes Req") echo "❌" ;;
+        Approved)      echo "✅" ;;
+        Merged)        echo "🎉" ;;
+        Closed)        echo "🚪" ;;
+    esac
+}
+
+# ─── Fetch PR status for a single cwd ────────────────────────────────────────
+fetch_pr_status() {
+    local cwd="$1"
+    local pr_cache_file="$2"
+    local now=$(date +%s)
+    local current_branch
+    current_branch=$(git -C "$cwd" branch --show-current 2>/dev/null) || return 0
+
+    # Skip default branches
+    case "$current_branch" in
+        main|master|develop) return 0 ;;
+    esac
+
+    # Extract owner/repo from remote URL
+    local remote_url owner repo
+    remote_url=$(git -C "$cwd" remote get-url origin 2>/dev/null) || return 0
+    owner=$(echo "$remote_url" | sed 's|.*[:/]\([^/]*\)/[^/]*$|\1|')
+    repo=$(echo "$remote_url" | sed 's|.*/\([^/]*\)\.git$|\1|;s|.*/\([^/]*\)$|\1|')
+
+    # Single GraphQL call for all PR data
+    local gql_resp pr_node
+    gql_resp=$(gh api graphql -F owner="$owner" -F repo="$repo" -F branch="$current_branch" -f query="$PR_GRAPHQL_QUERY" 2>/dev/null) || return 0
+    pr_node=$(echo "$gql_resp" | jq -r '.data.repository.pullRequests.nodes[0] // empty' 2>/dev/null)
+
+    if [ -z "$pr_node" ] || [ "$pr_node" = "null" ]; then
+        echo "{\"timestamp\":$now,\"branch\":\"$current_branch\",\"pr_status\":null,\"pr_number\":null,\"ci_state\":null,\"mergeable\":null,\"unresolved_threads\":0}" > "$pr_cache_file"
+        return 0
+    fi
+
+    local state is_draft review_decision pr_number pr_status
+    state=$(echo "$pr_node" | jq -r '.state')
+    is_draft=$(echo "$pr_node" | jq -r '.isDraft')
+    review_decision=$(echo "$pr_node" | jq -r '.reviewDecision // ""')
+    pr_number=$(echo "$pr_node" | jq -r '.number')
+
+    if [ "$is_draft" = "true" ]; then
+        pr_status="Draft"
+    elif [ "$state" = "MERGED" ]; then
+        pr_status="Merged"
+    elif [ "$state" = "CLOSED" ]; then
+        pr_status="Closed"
+    elif [ "$state" = "OPEN" ]; then
+        case "$review_decision" in
+            APPROVED) pr_status="Approved" ;;
+            CHANGES_REQUESTED) pr_status="Changes Req" ;;
+            REVIEW_REQUIRED) pr_status="In Review" ;;
+            *) pr_status="PR Open" ;;
+        esac
+    fi
+
+    # CI rollup state + head commit SHA
+    local ci_state head_sha
+    ci_state=$(echo "$pr_node" | jq -r '.commits.nodes[0].commit.statusCheckRollup.state // "UNKNOWN"')
+    head_sha=$(echo "$pr_node" | jq -r '.commits.nodes[0].commit.oid // ""')
+
+    # Mergeable
+    local mergeable
+    mergeable=$(echo "$pr_node" | jq -r '.mergeable // "UNKNOWN"')
+
+    # Count unresolved review threads
+    local unresolved_threads
+    unresolved_threads=$(echo "$pr_node" | jq '[.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+
+    echo "{\"timestamp\":$now,\"branch\":\"$current_branch\",\"pr_status\":\"$pr_status\",\"pr_number\":$pr_number,\"ci_state\":\"$ci_state\",\"head_sha\":\"$head_sha\",\"mergeable\":\"$mergeable\",\"unresolved_threads\":$unresolved_threads}" > "$pr_cache_file"
+}
+
+# ─── CI failure auto-inject ──────────────────────────────────────────────────
+inject_ci_notification() {
+    local cwd="$1"
+    local pr_cache_file="$2"
+    local ci_notified_file="$3"
+
+    local new_ci_state new_head_sha
+    new_ci_state=$(jq -r '.ci_state // empty' "$pr_cache_file" 2>/dev/null)
+    new_head_sha=$(jq -r '.head_sha // empty' "$pr_cache_file" 2>/dev/null)
+    [ -n "$new_ci_state" ] && [ -n "$new_head_sha" ] || return 0
+
+    # Only inject on failure
+    if [ "$new_ci_state" != "FAILURE" ] && [ "$new_ci_state" != "ERROR" ]; then
+        rm -f "$ci_notified_file"
+        return 0
+    fi
+
+    # Don't re-notify for the same commit
+    if [ -f "$ci_notified_file" ] && [ "$(cat "$ci_notified_file")" = "$new_head_sha" ]; then
+        return 0
+    fi
+
+    # Mark as notified for this commit
+    echo "$new_head_sha" > "$ci_notified_file"
+
+    # Fetch failure summary (5s timeout built into ci-failures)
+    local summary
+    summary=$("$HOME/tools/ci-failures" "" "$cwd" 2>/dev/null) || return 0
+    [ -z "$summary" ] && return 0
+
+    # Find the agent-deck session for this cwd
+    local session_id tmux_session
+    local cwd_resolved
+    cwd_resolved=$(cd "$cwd" 2>/dev/null && pwd -P)
+    session_id=$(agent-deck list --json 2>/dev/null | jq -r '.[] | .path + "\t" + .id' 2>/dev/null | while IFS=$'\t' read -r p id; do
+        resolved=$(cd "$p" 2>/dev/null && pwd -P)
+        [ "$resolved" = "$cwd_resolved" ] && echo "$id" && break
+    done)
+    [ -n "$session_id" ] || return 0
+
+    local message
+    message="CI failed. Fix it.
+
+${summary}"
+
+    # Try send first (works if session is running, regardless of reported status).
+    # Fall back to start if send fails (session truly not running).
+    if agent-deck session send "$session_id" "$message" --no-wait >/dev/null 2>&1; then
+        true
+    else
+        agent-deck session start "$session_id" -m "$message" >/dev/null 2>&1 &
+    fi
+}
+
+# ─── Update agent-deck session title with PR prefix ──────────────────────────
+update_session_title() {
+    local cwd="$1"
+    local pr_cache_file="$2"
+    local title_cache="$3"
+
+    # Skip if not in a git repo
+    git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+    # Find agent-deck session by resolved path
+    local session_id cwd_resolved
+    cwd_resolved=$(cd "$cwd" 2>/dev/null && pwd -P)
+    session_id=$(agent-deck list --json 2>/dev/null | jq -r '.[] | .path + "\t" + .id' 2>/dev/null | while IFS=$'\t' read -r p id; do
+        resolved=$(cd "$p" 2>/dev/null && pwd -P)
+        [ "$resolved" = "$cwd_resolved" ] && echo "$id" && break
+    done)
+    [ -n "$session_id" ] || return 0
+
+    local session_json current_title
+    session_json=$(agent-deck session show "$session_id" --json 2>/dev/null) || return 0
+    current_title=$(echo "$session_json" | jq -r '.title // empty')
+
+    # Resolve base title: use cached original, or derive from current title
+    local base_title
+    if [ -f "$title_cache" ]; then
+        base_title=$(cat "$title_cache")
+    else
+        # First run — strip only known prefixes (old text format, emoji#N, [emoji #N], [emoji])
+        base_title="$current_title"
+        # Old text format: [Status] Title
+        base_title=$(echo "$base_title" | sed 's/^\[Draft\] //;s/^\[PR Open\] //;s/^\[In Review\] //;s/^\[Changes Req\] //;s/^\[Approved\] //;s/^\[Merged\] //;s/^\[Closed\] //')
+        # Current format: [emoji #1234] Title
+        base_title=$(echo "$base_title" | sed 's/^\[.* #[0-9]*\] //')
+        # No-PR format: [🚧] Title
+        base_title=$(echo "$base_title" | sed 's/^\[🚧\] //')
+        echo "$base_title" > "$title_cache"
+    fi
+
+    # Default branches get clean title — no PR prefix
+    local current_branch
+    current_branch=$(git -C "$cwd" branch --show-current 2>/dev/null)
+    local new_title
+    case "$current_branch" in
+        main|master|develop)
+            new_title="$base_title"
+            ;;
+        *)
+            # Read current PR status and number
+            local pr_st="" pr_num=""
+            if [ -f "$pr_cache_file" ]; then
+                pr_st=$(jq -r '.pr_status // empty' "$pr_cache_file" 2>/dev/null)
+                pr_num=$(jq -r '.pr_number // empty' "$pr_cache_file" 2>/dev/null)
+                [ "$pr_st" = "null" ] && pr_st=""
+                [ "$pr_num" = "null" ] && pr_num=""
+            fi
+
+            local pr_emoji
+            pr_emoji=$(pr_status_emoji "$pr_st")
+
+            if [ -n "$pr_emoji" ] && [ -n "$pr_num" ]; then
+                local extra=""
+                # CI status (only show when not green)
+                local ci_st
+                ci_st=$(jq -r '.ci_state // empty' "$pr_cache_file" 2>/dev/null)
+                case "$ci_st" in
+                    FAILURE|ERROR) extra="${extra} 🔥" ;;
+                    PENDING)       extra="${extra} ⏳" ;;
+                esac
+                # Merge conflicts
+                local merge_st
+                merge_st=$(jq -r '.mergeable // empty' "$pr_cache_file" 2>/dev/null)
+                [ "$merge_st" = "CONFLICTING" ] && extra="${extra} 💥"
+                # Unresolved threads
+                local threads
+                threads=$(jq -r '.unresolved_threads // 0' "$pr_cache_file" 2>/dev/null)
+                [ "$threads" -gt 0 ] 2>/dev/null && extra="${extra} 💬${threads}"
+
+                if [ -n "$extra" ]; then
+                    new_title="[${pr_emoji} #${pr_num}${extra}] ${base_title}"
+                else
+                    new_title="[${pr_emoji} #${pr_num}] ${base_title}"
+                fi
+            else
+                new_title="[🚧] ${base_title}"
+            fi
+            ;;
+    esac
+
+    # Only rename if changed
+    if [ "$current_title" != "$new_title" ]; then
+        agent-deck rename "$session_id" "$new_title" >/dev/null 2>&1
+    fi
+}
+
+# ─── Main: loop over all agent-deck sessions ─────────────────────────────────
+main() {
+    local sessions
+    sessions=$(agent-deck list --json 2>/dev/null) || exit 0
+
+    local count
+    count=$(echo "$sessions" | jq 'length')
+    [ "$count" -gt 0 ] || exit 0
+
+    echo "$sessions" | jq -r '.[].path' | while IFS= read -r session_path; do
+        # Resolve path
+        local cwd
+        cwd=$(cd "$session_path" 2>/dev/null && pwd -P) || continue
+
+        # Must be a git repo
+        git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || continue
+
+        # Skip default branches
+        local branch
+        branch=$(git -C "$cwd" branch --show-current 2>/dev/null) || continue
+        case "$branch" in
+            main|master|develop) continue ;;
+        esac
+
+        # Derive cache file paths (same convention as statusline)
+        local cwd_hash
+        cwd_hash=$(echo "$cwd" | md5 -q 2>/dev/null || echo "$cwd" | md5sum | cut -c1-8)
+        local pr_cache_file="${TMPDIR:-/tmp}/claude_pr_cache_${cwd_hash}.json"
+        local ci_notified_file="${TMPDIR:-/tmp}/claude_ci_notified_${cwd_hash}"
+        local title_cache="${TMPDIR:-/tmp}/claude_ad_title_${cwd_hash}.txt"
+
+        # Save old head SHA before refresh (for transition detection)
+        local old_head_sha=""
+        if [ -f "$pr_cache_file" ]; then
+            old_head_sha=$(jq -r '.head_sha // empty' "$pr_cache_file" 2>/dev/null)
+        fi
+
+        # Fetch PR status
+        fetch_pr_status "$cwd" "$pr_cache_file"
+
+        # CI injection + title update
+        inject_ci_notification "$cwd" "$pr_cache_file" "$ci_notified_file"
+        update_session_title "$cwd" "$pr_cache_file" "$title_cache"
+
+        echo "[$(date '+%H:%M:%S')] Polled: $(basename "$cwd") branch=$branch"
+    done
+}
+
+main

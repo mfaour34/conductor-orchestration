@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""epic-dag — DAG helper for epic runner conductors.
+
+Sole owner of state.json mutations. The conductor reads state.json
+for informational purposes but delegates all writes to this script.
+
+Usage:
+    epic-dag next <dir>                          # ticket IDs ready to spawn
+    epic-dag transition <dir> <ticket> <state>   # move ticket to new state
+    epic-dag set <dir> <ticket> <field> <value>  # set a field on a ticket
+    epic-dag skip <dir> <ticket>                 # skip ticket, recalc deps
+    epic-dag complete <dir>                      # exit 0 if all done/skipped
+    epic-dag status <dir> [--json]               # print DAG status
+"""
+
+import json
+import sys
+from pathlib import Path
+
+VALID_STATES = ["pending", "speccing", "awaiting_user", "in_progress", "pr_open", "done", "skipped"]
+
+VALID_TRANSITIONS = {
+    "pending": ["speccing", "skipped"],
+    "speccing": ["awaiting_user", "skipped"],
+    "awaiting_user": ["in_progress", "skipped"],
+    "in_progress": ["pr_open", "skipped"],
+    "pr_open": ["done", "skipped"],
+    "done": [],
+    "skipped": [],
+}
+
+ACTIVE_STATES = {"speccing", "awaiting_user", "in_progress", "pr_open"}
+
+SETTABLE_FIELDS = {"child_session", "pr_number", "branch", "worktree_path", "merge_blocked"}
+
+
+def load_state(state_path: Path) -> dict:
+    with open(state_path) as f:
+        return json.load(f)
+
+
+def save_state(state_path: Path, state: dict) -> None:
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
+        f.write("\n")
+
+
+def get_state_path(dir_arg: str) -> Path:
+    p = Path(dir_arg).expanduser() / "state.json"
+    if not p.exists():
+        print(f"Error: {p} not found", file=sys.stderr)
+        sys.exit(1)
+    return p
+
+
+def cmd_next(dir_arg: str) -> None:
+    """Return ticket IDs ready to spawn (pending, deps satisfied, under cap)."""
+    state_path = get_state_path(dir_arg)
+    state = load_state(state_path)
+    tickets = state.get("tickets", {})
+    cap = state.get("concurrency_cap", 3)
+    paused = state.get("paused", False)
+
+    if paused:
+        return
+
+    active_count = sum(1 for t in tickets.values() if t.get("state") in ACTIVE_STATES)
+    available_slots = cap - active_count
+
+    if available_slots <= 0:
+        return
+
+    ready = []
+    for ticket_id, ticket in tickets.items():
+        if ticket.get("state") != "pending":
+            continue
+        deps = ticket.get("depends_on", [])
+        all_resolved = all(
+            tickets.get(d, {}).get("state") in ("done", "skipped")
+            for d in deps
+        )
+        if all_resolved:
+            ready.append(ticket_id)
+
+    for ticket_id in ready[:available_slots]:
+        print(ticket_id)
+
+
+def cmd_transition(dir_arg: str, ticket_id: str, new_state: str) -> None:
+    """Transition a ticket to a new state, validating the transition."""
+    if new_state not in VALID_STATES:
+        print(f"Error: '{new_state}' is not a valid state. Valid: {', '.join(VALID_STATES)}", file=sys.stderr)
+        sys.exit(1)
+
+    state_path = get_state_path(dir_arg)
+    state = load_state(state_path)
+    tickets = state.get("tickets", {})
+
+    if ticket_id not in tickets:
+        print(f"Error: ticket '{ticket_id}' not found in state.json", file=sys.stderr)
+        sys.exit(1)
+
+    current = tickets[ticket_id].get("state", "pending")
+    allowed = VALID_TRANSITIONS.get(current, [])
+
+    if new_state not in allowed:
+        print(
+            f"Error: cannot transition '{ticket_id}' from '{current}' to '{new_state}'. "
+            f"Allowed: {', '.join(allowed) if allowed else 'none (terminal state)'}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    tickets[ticket_id]["state"] = new_state
+    save_state(state_path, state)
+
+
+def cmd_set(dir_arg: str, ticket_id: str, field: str, value: str) -> None:
+    """Set a field on a ticket."""
+    state_path = get_state_path(dir_arg)
+    state = load_state(state_path)
+    tickets = state.get("tickets", {})
+
+    # Handle global fields (e.g., paused)
+    if ticket_id == "_global":
+        if field == "paused":
+            state["paused"] = value.lower() in ("true", "1", "yes")
+        else:
+            state[field] = value
+        save_state(state_path, state)
+        return
+
+    if ticket_id not in tickets:
+        print(f"Error: ticket '{ticket_id}' not found in state.json", file=sys.stderr)
+        sys.exit(1)
+
+    if field not in SETTABLE_FIELDS:
+        print(f"Error: field '{field}' is not settable. Allowed: {', '.join(sorted(SETTABLE_FIELDS))}", file=sys.stderr)
+        sys.exit(1)
+
+    # Type coercion for known fields
+    if field == "merge_blocked":
+        value = value.lower() in ("true", "1", "yes")
+    elif field == "pr_number":
+        try:
+            value = int(value)
+        except ValueError:
+            pass
+
+    tickets[ticket_id][field] = value
+    save_state(state_path, state)
+
+
+def cmd_skip(dir_arg: str, ticket_id: str) -> None:
+    """Skip a ticket. Works from any non-terminal state."""
+    state_path = get_state_path(dir_arg)
+    state = load_state(state_path)
+    tickets = state.get("tickets", {})
+
+    if ticket_id not in tickets:
+        print(f"Error: ticket '{ticket_id}' not found in state.json", file=sys.stderr)
+        sys.exit(1)
+
+    current = tickets[ticket_id].get("state", "pending")
+    if current in ("done", "skipped"):
+        print(f"Warning: ticket '{ticket_id}' is already '{current}'", file=sys.stderr)
+        return
+
+    tickets[ticket_id]["state"] = "skipped"
+    save_state(state_path, state)
+
+
+def cmd_complete(dir_arg: str) -> None:
+    """Exit 0 if all tickets are done or skipped, exit 1 otherwise."""
+    state_path = get_state_path(dir_arg)
+    state = load_state(state_path)
+    tickets = state.get("tickets", {})
+
+    for ticket in tickets.values():
+        if ticket.get("state") not in ("done", "skipped"):
+            sys.exit(1)
+
+    sys.exit(0)
+
+
+def cmd_status(dir_arg: str, as_json: bool = False) -> None:
+    """Print DAG status."""
+    state_path = get_state_path(dir_arg)
+    state = load_state(state_path)
+    tickets = state.get("tickets", {})
+
+    if as_json:
+        print(json.dumps(state, indent=2))
+        return
+
+    epic_id = state.get("epic_id", "?")
+    epic_title = state.get("epic_title", "?")
+    cap = state.get("concurrency_cap", 3)
+    paused = state.get("paused", False)
+
+    active_count = sum(1 for t in tickets.values() if t.get("state") in ACTIVE_STATES)
+    done_count = sum(1 for t in tickets.values() if t.get("state") in ("done", "skipped"))
+
+    print(f"Epic: {epic_id} — {epic_title}")
+    print(f"Progress: {done_count}/{len(tickets)} complete | Active: {active_count}/{cap} | Paused: {paused}")
+    print()
+
+    state_groups = {}
+    for ticket_id, ticket in tickets.items():
+        s = ticket.get("state", "pending")
+        state_groups.setdefault(s, []).append(ticket_id)
+
+    for s in VALID_STATES:
+        group = state_groups.get(s, [])
+        if not group:
+            continue
+        print(f"  [{s}]")
+        for tid in group:
+            t = tickets[tid]
+            title = t.get("title", "")
+            deps = t.get("depends_on", [])
+            dep_str = f" (depends on: {', '.join(deps)})" if deps else ""
+            pr = t.get("pr_number")
+            pr_str = f" PR #{pr}" if pr else ""
+            print(f"    {tid}: {title}{dep_str}{pr_str}")
+        print()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "next":
+        if len(sys.argv) < 3:
+            print("Usage: epic-dag next <dir>", file=sys.stderr)
+            sys.exit(1)
+        cmd_next(sys.argv[2])
+
+    elif cmd == "transition":
+        if len(sys.argv) < 5:
+            print("Usage: epic-dag transition <dir> <ticket-id> <new-state>", file=sys.stderr)
+            sys.exit(1)
+        cmd_transition(sys.argv[2], sys.argv[3], sys.argv[4])
+
+    elif cmd == "set":
+        if len(sys.argv) < 6:
+            print("Usage: epic-dag set <dir> <ticket-id> <field> <value>", file=sys.stderr)
+            sys.exit(1)
+        cmd_set(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+
+    elif cmd == "skip":
+        if len(sys.argv) < 4:
+            print("Usage: epic-dag skip <dir> <ticket-id>", file=sys.stderr)
+            sys.exit(1)
+        cmd_skip(sys.argv[2], sys.argv[3])
+
+    elif cmd == "complete":
+        if len(sys.argv) < 3:
+            print("Usage: epic-dag complete <dir>", file=sys.stderr)
+            sys.exit(1)
+        cmd_complete(sys.argv[2])
+
+    elif cmd == "status":
+        if len(sys.argv) < 3:
+            print("Usage: epic-dag status <dir> [--json]", file=sys.stderr)
+            sys.exit(1)
+        as_json = "--json" in sys.argv
+        cmd_status(sys.argv[2], as_json=as_json)
+
+    else:
+        print(f"Error: unknown command '{cmd}'", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

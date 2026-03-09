@@ -1,0 +1,55 @@
+{
+  "epic_id": "PROJ-42",
+  "epic_title": "Example Epic",
+  "concurrency_cap": 3,
+  "paused": false,
+  "tickets": {
+    "PROJ-100": {
+      "title": "First task (no dependencies)",
+      "project_key": "PROJ",
+      "repo_path": "/path/to/repo",
+      "state": "pending",
+      "depends_on": [],
+      "blocks": [
+        "PROJ-101"
+      ],
+      "child_session": null,
+      "pr_number": null,
+      "branch": null,
+      "worktree_path": null,
+      "merge_blocked": false
+    },
+    "PROJ-101": {
+      "title": "Second task (depends on PROJ-100)",
+      "project_key": "PROJ",
+      "repo_path": "/path/to/repo",
+      "state": "pending",
+      "depends_on": [
+        "PROJ-100"
+      ],
+      "blocks": [
+        "PROJ-102"
+      ],
+      "child_session": null,
+      "pr_number": null,
+      "branch": null,
+      "worktree_path": null,
+      "merge_blocked": false
+    },
+    "PROJ-102": {
+      "title": "Final task (depends on PROJ-101)",
+      "project_key": "PROJ",
+      "repo_path": "/path/to/repo",
+      "state": "pending",
+      "depends_on": [
+        "PROJ-101"
+      ],
+      "blocks": [],
+      "child_session": null,
+      "pr_number": null,
+      "branch": null,
+      "worktree_path": null,
+      "merge_blocked": false
+    }
+  }
+}

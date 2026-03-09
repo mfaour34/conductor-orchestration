@@ -1,0 +1,62 @@
+#!/bin/bash
+# ci-failures — Fetch CI failure summary from GitHub Actions
+# Usage: ci-failures [branch] [repo-path]
+# Outputs: failed job name(s) and run URL
+
+set -euo pipefail
+
+BRANCH="${1:-}"
+REPO_PATH="${2:-$(pwd)}"
+
+# Resolve owner/repo from git remote
+REMOTE_URL=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null)
+if [ -z "$REMOTE_URL" ]; then
+    echo "Error: Not a git repository or no origin remote"
+    exit 1
+fi
+
+OWNER=$(echo "$REMOTE_URL" | sed 's|.*[:/]\([^/]*\)/[^/]*$|\1|')
+REPO=$(echo "$REMOTE_URL" | sed 's|.*/\([^/]*\)\.git$|\1|;s|.*/\([^/]*\)$|\1|')
+REPO_FULL="${OWNER}/${REPO}"
+
+# Default to current branch
+if [ -z "$BRANCH" ]; then
+    BRANCH=$(git -C "$REPO_PATH" branch --show-current 2>/dev/null)
+fi
+
+if [ -z "$BRANCH" ]; then
+    echo "Error: Could not determine branch"
+    exit 1
+fi
+
+# Find the latest failed run on this branch
+RUN_JSON=$(gh run list \
+    --repo "$REPO_FULL" \
+    --branch "$BRANCH" \
+    --limit 1 \
+    --status failure \
+    --json databaseId,name,url \
+    2>/dev/null) || { echo "Error: Failed to list runs"; exit 1; }
+
+RUN_ID=$(echo "$RUN_JSON" | jq -r '.[0].databaseId // empty')
+RUN_URL=$(echo "$RUN_JSON" | jq -r '.[0].url // empty')
+RUN_NAME=$(echo "$RUN_JSON" | jq -r '.[0].name // empty')
+
+if [ -z "$RUN_ID" ]; then
+    echo "No failed runs found on branch $BRANCH"
+    exit 0
+fi
+
+# Get all failed job names from this run
+FAILED_JOBS=$(gh api \
+    "repos/${REPO_FULL}/actions/runs/${RUN_ID}/jobs" \
+    --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")' \
+    2>/dev/null) || FAILED_JOBS=""
+
+if [ -n "$FAILED_JOBS" ]; then
+    echo "Failed: ${FAILED_JOBS}"
+else
+    echo "Failed workflow: ${RUN_NAME}"
+fi
+
+echo "Run: $RUN_URL"
